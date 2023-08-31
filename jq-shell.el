@@ -61,6 +61,21 @@
 When non-nil, display errors in overlay in shell buffer instead."
   :type 'boolean)
 
+(defvar-keymap jq-shell-minor-mode-map
+  :doc "Keymap in jq shell."
+  "C-c C-k" #'jq-shell-quit
+  "C-c C-a" #'jq-shell-toggle-autorun
+  "C-c C-l" #'jq-shell-clear-output
+  "C-c C-c" #'jq-shell-run)
+
+(define-minor-mode jq-shell-minor-mode
+  "Mode active in jq shell."
+  :keymap jq-shell-minor-mode-map
+  (if jq-shell-minor-mode
+      (when jq-shell-autorun
+        (add-hook 'after-change-functions #'jq-shell-maybe-run nil t))
+    (remove-hook 'after-change-functions #'jq-shell-maybe-run t)))
+
 (defvar jq-shell-sessions (make-hash-table :test #'equal)
   "All active jq shell sessions.")
 
@@ -76,7 +91,7 @@ When non-nil, display errors in overlay in shell buffer instead."
 (defvar-local jq-shell-session nil
   "Cached local jq shell session.")
 
-(defvar-local jq-shell--errors nil
+(defvar-local jq-shell--stderr nil
   "Overlay to display jq stderr when errors are shown in shell.")
 
 ;; stored window configuration prior to starting jq shell
@@ -97,20 +112,22 @@ When non-nil, display errors in overlay in shell buffer instead."
     (select-window
      (window--display-buffer shell (split-window-below -15) 'window))))
 
-(defun jq-shell--show-stderr (stdout stderr)
-  "Show STDERR buffer in lower part of STDOUT buffer."
+(defun jq-shell--show-stderr (shell stdout stderr)
+  "Show STDERR buffer in lower part of STDOUT buffer when visible or SHELL."
   (unless (get-buffer-window stderr)
-    (with-selected-window (get-buffer-window stdout)
-      (window--display-buffer stderr (split-window-below -15) 'window))))
+    (when-let (win (or (get-buffer-window stdout)
+                       (get-buffer-window shell)))
+     (with-selected-window win
+       (window--display-buffer stderr (split-window-below -15) 'window)))))
 
-(defun jq-shell--update-overlay (buffer &optional str)
+(defun jq-shell--update-stderr-overlay (buffer &optional str)
   "Update error overlay in BUFFER with STR."
   (with-current-buffer buffer
-    (unless (overlayp jq-shell--errors)
-      (setq jq-shell--errors
+    (unless (overlayp jq-shell--stderr)
+      (setq jq-shell--stderr
             (make-overlay (point-min) (point-min) (current-buffer) 'front))
-      (overlay-put jq-shell--errors 'invisible t))
-    (overlay-put jq-shell--errors 'after-string (and str (concat str "\n")))))
+      (overlay-put jq-shell--stderr 'invisible t))
+    (overlay-put jq-shell--stderr 'after-string (and str (concat str "\n")))))
 
 (defun jq-shell--setup-shell (session)
   "Setup jq shell buffer for SESSION."
@@ -166,16 +183,40 @@ Restore initial window configuration unless NO-RESTORE."
   (maphash (lambda (k _v) (jq-shell--cleanup k t)) jq-shell-sessions)
   (and restore (jq-shell--restore-window-configuration)))
 
+(defvar jq-shell--errors-query
+  (when (treesit-available-p)
+    (treesit-query-compile 'jq '(((identifier) @id (:equal "" @id))
+                                 (ERROR) @err)))
+  "Tree sitter query to match errors and missing identifiers.")
+
+(defface jq-shell-error
+  '((((supports :underline (:style wave)))
+     :underline (:style wave :color "Red1"))
+    (t
+     :underline t :inherit error))
+  "Jq shell face for errors.")
+
+(defun jq-shell--make-overlay (beg end)
+  "Make error overlay from BEG to END."
+  (let ((ov (make-overlay beg end)))
+    (overlay-put ov 'face 'jq-shell-error)
+    (overlay-put ov 'jq-shell t)))
+
+(defun jq-shell--update-errors ()
+  "Update error overlays in jq shell buffer."
+  (if-let ((ranges
+            (treesit-query-range
+             'jq jq-shell--errors-query (point-min) (point-max))))
+      (prog1 t
+        (dolist (range ranges)
+          (jq-shell--make-overlay (car range) (1+ (cdr range)))))
+    (remove-overlays (point-min) (point-max) 'jq-shell t)
+    nil))
+
 (defun jq-shell-should-run-p ()
   "Non-nil when no errors are detected in tree sitter parse tree."
   (and jq-shell-minor-mode
-       (null (treesit-search-subtree (treesit-buffer-root-node) "ERROR"))
-       (let ((node (treesit-node-at (point))))
-         ;; tree-sitter doesn't currently have a way to match MISSING nodes
-         ;; directly
-         (if (treesit-node-match-p node "identifier")
-             (not (string-empty-p (treesit-node-text node)))
-           t))))
+       (null (jq-shell--update-errors))))
 
 (defun jq-shell-maybe-run (&rest _)
   "Run current query when no syntax errors detected."
@@ -194,8 +235,8 @@ Restore initial window configuration unless NO-RESTORE."
         (insert-file-contents stderr-file)
         (goto-char (point-min))
         (if jq-shell-errors-in-overlay
-            (jq-shell--update-overlay shell (buffer-string))
-          (jq-shell--show-stderr stdout stderr))))
+            (jq-shell--update-stderr-overlay shell (buffer-string))
+          (jq-shell--show-stderr shell stdout stderr))))
     (unless status
       ;; delete old input if query was successful
       (with-current-buffer stdout
@@ -253,21 +294,6 @@ With \\[universal-argument] PREFIX, run query before point."
   (interactive nil jq-shell-minor-mode-map)
   (with-current-buffer (jq-shell--session-stdout jq-shell-session)
     (erase-buffer)))
-
-(defvar-keymap jq-shell-minor-mode-map
-  :doc "Keymap in jq shell."
-  "C-c C-k" #'jq-shell-quit
-  "C-c C-a" #'jq-shell-toggle-autorun
-  "C-c C-l" #'jq-shell-clear-output
-  "C-c C-c" #'jq-shell-run)
-
-(define-minor-mode jq-shell-minor-mode
-  "Mode active in jq shell."
-  :keymap jq-shell-minor-mode-map
-  (if jq-shell-minor-mode
-      (when jq-shell-autorun
-        (add-hook 'after-change-functions #'jq-shell-maybe-run nil t))
-    (remove-hook 'after-change-functions #'jq-shell-maybe-run t)))
 
 ;;;###autoload
 (defun jq-shell (&optional buffer region)
