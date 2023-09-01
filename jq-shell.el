@@ -5,7 +5,7 @@
 ;; Author: Noah Peart <noah.v.peart@gmail.com>
 ;; URL: https://github.com/nverno/jq-shell
 ;; Version: 0.1
-;; Package-Requires: ((emacs "29.1") (jq-ts-mode "1.0") (json-mode "1.6"))
+;; Package-Requires: ((emacs "29.1") (jq-ts-mode "1.0")
 ;; Created: 28 August 2023
 
 ;; This file is not part of GNU Emacs.
@@ -27,17 +27,20 @@
 
 ;;; Commentary:
 ;;
-;; Run jq queries interactively against a source buffer.
+;; Run jq queries interactively against a source buffer, similar to the
+;; interface from https://jqplay.org.
 ;;
-;; Uses tree sitter (`jq-ts-mode') to guess if current query syntax is
-;; error-free enough to run.
+;; The Jq shell's major mode is `jq-ts-mode', which uses tree sitter. Jq shell
+;; tries to guess if current query syntax is error-free enough to run. Any
+;; errors or missing nodes from the parse tree are highlighted similarly to
+;; flycheck.
 ;;
-;; The jq shell uses `jq-ts-mode' and the output is `json-mode'.
+;; If `json-mode' is available, the result buffer will be `json-mode'.
 ;;
 ;;; Code:
 
+(require 'transient)
 (require 'jq-ts-mode)
-(require 'json-mode)
 
 (defgroup jq-shell nil
   "Run jq interactively on buffer."
@@ -48,8 +51,10 @@
   "Command to run jq."
   :type 'string)
 
-(defcustom jq-shell-default-options '()
-  "Default options for running jq."
+(defcustom jq-shell-default-arguments '("--raw-output")
+  ;; FIXME: how to make transient recognize short or long form args in
+  ;; `:values'?
+  "Default jq arguments (long-form) for running queries."
   :type '(repeat string))
 
 (defcustom jq-shell-autorun t
@@ -66,7 +71,9 @@ When non-nil, display errors in overlay in shell buffer instead."
   "C-c C-k" #'jq-shell-quit
   "C-c C-a" #'jq-shell-toggle-autorun
   "C-c C-l" #'jq-shell-clear-output
-  "C-c C-c" #'jq-shell-run)
+  "C-c C-c" #'jq-shell-run
+  "C-c C-f" #'jq-shell-arguments
+  "C-c C-w" #'jq-shell-arrange-windows)
 
 (define-minor-mode jq-shell-minor-mode
   "Mode active in jq shell."
@@ -86,6 +93,7 @@ When non-nil, display errors in overlay in shell buffer instead."
   stdin                                       ; stdin buffer
   stdout                                      ; stdout buffer
   stderr                                      ; stderr buffer
+  (args jq-shell-default-arguments)           ; jq arguments
   (stderr-file (make-temp-file "jq-shell")))  ; stderr file
 
 (defvar-local jq-shell-session nil
@@ -93,6 +101,9 @@ When non-nil, display errors in overlay in shell buffer instead."
 
 (defvar-local jq-shell--stderr nil
   "Overlay to display jq stderr when errors are shown in shell.")
+
+(defvar-local jq-shell--command nil
+  "Overlay to display the jq command that produced output.")
 
 ;; stored window configuration prior to starting jq shell
 (defvar jq-shell--window-configuration nil)
@@ -112,22 +123,25 @@ When non-nil, display errors in overlay in shell buffer instead."
     (select-window
      (window--display-buffer shell (split-window-below -15) 'window))))
 
-(defun jq-shell--show-stderr (shell stdout stderr)
-  "Show STDERR buffer in lower part of STDOUT buffer when visible or SHELL."
+(defun jq-shell--show-stderr (stdout stderr)
+  "Show STDERR buffer in lower part of STDOUT buffer when visible or popup buffer."
   (unless (get-buffer-window stderr)
-    (when-let (win (or (get-buffer-window stdout)
-                       (get-buffer-window shell)))
-     (with-selected-window win
-       (window--display-buffer stderr (split-window-below -15) 'window)))))
+    (if-let (win (get-buffer-window stdout))
+        (with-selected-window win
+          (window--display-buffer stderr (split-window-below -15) 'window))
+      (display-buffer-pop-up-window stderr nil))))
 
-(defun jq-shell--update-stderr-overlay (buffer &optional str)
-  "Update error overlay in BUFFER with STR."
+(defun jq-shell--update-overlay (buffer overlay &optional str placeholder _face)
+  "Update header OVERLAY in BUFFER with STR or PLACEHOLDER."
   (with-current-buffer buffer
-    (unless (overlayp jq-shell--stderr)
-      (setq jq-shell--stderr
-            (make-overlay (point-min) (point-min) (current-buffer) 'front))
-      (overlay-put jq-shell--stderr 'invisible t))
-    (overlay-put jq-shell--stderr 'after-string (and str (concat str "\n")))))
+    (unless (and (boundp overlay) (overlayp (symbol-value overlay)))
+      (overlay-put 
+       (set overlay (make-overlay (point-min) (point-min) (current-buffer) 'front))
+       'invisible t))
+    (let ((ov (symbol-value overlay))
+          (border (make-string (window-body-width) ?―)))
+      (overlay-put
+       ov 'after-string (if str (concat str "\n" border)  placeholder)))))
 
 (defun jq-shell--setup-shell (session)
   "Setup jq shell buffer for SESSION."
@@ -137,30 +151,50 @@ When non-nil, display errors in overlay in shell buffer instead."
     (add-hook 'kill-buffer-hook #'jq-shell--cleanup nil t)
     (setq-local jq-shell-session session)))
 
+(defun jq-shell--stdout-buffer (stdin)
+  "Setup stdout for STDIN."
+  (let* ((name (format "*jq[%s]::stdout*" (buffer-name stdin)))
+         (buf (get-buffer name)))
+    (if (buffer-live-p buf) buf
+      (with-current-buffer (get-buffer-create name)
+        (erase-buffer)
+        (when (fboundp 'json-mode)
+          (json-mode))
+        (current-buffer)))))
+
+(defun jq-shell--stderr-buffer (stdin)
+  "Get or create stderr buffer for STDIN."
+  (let* ((name (format "*jq[%s]::stderr*" (buffer-name stdin)))
+         (buf (get-buffer name)))
+    (if (buffer-live-p buf) buf
+      (with-current-buffer (get-buffer-create name)
+        (erase-buffer)
+        (current-buffer)))))
+
 (defun jq-shell-make-session (&optional buffer region)
   "Create a new jq shell session for BUFFER or current buffer.
 Use REGION if non-nil, or current region if active, or whole buffer."
-  (let* ((buffer (or buffer (current-buffer)))
-         (name (buffer-name buffer))
-         (bname (format "jq[%s]" name)))
+  (let ((buffer (or buffer (current-buffer))))
     (set-buffer buffer)
-    (cl-macrolet ((jq:buffer (&optional suffix &rest body)
-                    `(with-current-buffer (get-buffer-create
-                                           (concat "*" bname ,suffix "*"))
-                       (prog1 (current-buffer) ,@body))))
-      (let ((session
-             (jq-shell--make-session
-              :stdin buffer
-              :region (or region
-                          (and (region-active-p) (car (region-bounds)))
-                          (cons (point-min) (point-max)))
-              :stdout (jq:buffer "::stdout"
-                                 (erase-buffer)
-                                 (json-mode))
-              :stderr (jq:buffer "::stderr" (erase-buffer))
-              :shell (jq:buffer nil (erase-buffer)))))
-        (jq-shell--setup-shell session)
-        (puthash (jq-shell--session-shell session) session jq-shell-sessions)))))
+    (let ((session
+           (jq-shell--make-session
+            :stdin buffer
+            :region (or region
+                        (and (region-active-p) (car (region-bounds)))
+                        (cons (point-min) (point-max)))
+            :stdout (jq-shell--stdout-buffer buffer)
+            :stderr (jq-shell--stderr-buffer buffer)
+            :shell (get-buffer-create (format "*jq[%s]*" (buffer-name buffer))))))
+      (jq-shell--setup-shell session)
+      (puthash (jq-shell--session-shell session) session jq-shell-sessions))))
+
+(defun jq-shell--ensure-live (session)
+  "Ensure buffers are available for SESSION."
+  (pcase-let (((cl-struct jq-shell--session stdin stdout stderr) session))
+    (unless (buffer-live-p stdout)
+      (setf (jq-shell--session-stdout session) (jq-shell--stdout-buffer stdin)))
+    (unless (buffer-live-p stderr)
+      (setf (jq-shell--session-stderr session) (jq-shell--stderr-buffer stdin)))))
 
 (defun jq-shell--cleanup (&optional buffer no-restore)
   "Cleanup resources associated with jq shell BUFFER.
@@ -196,7 +230,7 @@ Restore initial window configuration unless NO-RESTORE."
      :underline t :inherit error))
   "Jq shell face for errors.")
 
-(defun jq-shell--make-overlay (beg end)
+(defun jq-shell--make-error-overlay (beg end)
   "Make error overlay from BEG to END."
   (let ((ov (make-overlay beg end)))
     (overlay-put ov 'face 'jq-shell-error)
@@ -209,60 +243,123 @@ Restore initial window configuration unless NO-RESTORE."
              'jq jq-shell--errors-query (point-min) (point-max))))
       (prog1 t
         (dolist (range ranges)
-          (jq-shell--make-overlay (car range) (1+ (cdr range)))))
+          (jq-shell--make-error-overlay (car range) (1+ (cdr range)))))
     (remove-overlays (point-min) (point-max) 'jq-shell t)
     nil))
 
 (defun jq-shell-should-run-p ()
-  "Non-nil when no errors are detected in tree sitter parse tree."
+  "Non-nil when no errors/missing identifiers are detected in tree sitter
+parse tree."
   (and jq-shell-minor-mode
-       (null (jq-shell--update-errors))))
+       (null (jq-shell--update-errors))
+       ;; Note: error query won't pick up missing trailing node until a space is
+       ;; entered
+       (save-excursion
+         (goto-char (point-max))
+         (skip-syntax-backward " ")
+         (not (memq (char-before) '(?| ?, ?\( ?\[ ?\{))))))
 
 (defun jq-shell-maybe-run (&rest _)
   "Run current query when no syntax errors detected."
   (and (jq-shell-should-run-p) (jq-shell--run)))
 
-(defun jq-shell--update-output (status)
-  "Update session buffers after command exited with STATUS."
-  (and (zerop status) (setq status nil))
-  (pcase-let* (((cl-struct jq-shell--session shell stderr stdout stderr-file)
+(defun jq-shell--format-command (args jq-cmd)
+  "Format jq cmd from ARGS and JQ-CMD."
+  (let ((cmd (concat "jq " (mapconcat 'identity args " "))))
+    (add-text-properties
+     0 (length cmd) (list 'face 'font-lock-function-name-face) cmd)
+    (concat cmd " '" jq-cmd "'")))
+
+(defun jq-shell--update-output (status &optional jq-cmd)
+  "Update session buffers after command exited with STATUS.
+Optionally, add JQ-CMD to jq command in stdout."
+  (pcase-let* (((cl-struct jq-shell--session shell args stderr stdout stderr-file)
                 jq-shell-session))
     (with-current-buffer stderr
       (erase-buffer)
-      (if (null status)
-          (when-let (win (get-buffer-window))
-            (delete-window win))
-        (insert-file-contents stderr-file)
-        (goto-char (point-min))
+      (if (zerop status)
+          (progn
+            (when-let (win (get-buffer-window)) (delete-window win))
+            (and jq-shell-errors-in-overlay
+                 (jq-shell--update-overlay shell 'jq-shell--stderr nil)))
+        (save-excursion
+          (insert-file-contents stderr-file)
+          (goto-char (point-max))
+          (insert (format "exit status: %s" status)))
         (if jq-shell-errors-in-overlay
-            (jq-shell--update-stderr-overlay shell (buffer-string))
-          (jq-shell--show-stderr shell stdout stderr))))
-    (unless status
-      ;; delete old input if query was successful
+            (jq-shell--update-overlay shell 'jq-shell--stderr (buffer-string))
+          (jq-shell--show-stderr stdout stderr))))
+    (when (zerop status)
+      ;; delete old input if query was successful and update command
       (with-current-buffer stdout
         (delete-region (point) (point-max))
-        (goto-char (point-min))))))
+        (goto-char (point-min))
+        (jq-shell--update-overlay
+         stdout 'jq-shell--command (jq-shell--format-command args jq-cmd)
+         "\n\n")))))
 
 (defun jq-shell--run (&optional beg end)
   "Run jq cmd from BEG to END in jq shell buffer."
-  (pcase-let (((cl-struct jq-shell--session region stdin stdout stderr-file)
+  (jq-shell--ensure-live jq-shell-session)
+  (pcase-let (((cl-struct jq-shell--session region stdin stdout stderr-file args)
                jq-shell-session))
     (unless (buffer-live-p stdin)
-      (user-error "Input buffer %s is dead" stdin))
+      (user-error "Input buffer %s is dead" (buffer-name stdin)))
     (let* ((beg (or beg (point-min)))
            (end (or end (point-max)))
            (jq-cmd (buffer-substring beg end))
-           (cmd (format "%s %s %s %s"
+           (cmd (format "%s %s %s"
                         jq-shell-command
-                        (mapconcat 'identity jq-shell-default-options " ")
-                        ;; FIXME: args
-                        "-r"
+                        (mapconcat 'identity args " ")
                         (shell-quote-argument jq-cmd))))
       (jq-shell--update-output
        (with-current-buffer stdin
          (call-process-region
           (car region) (cdr region) shell-file-name nil (list stdout stderr-file) nil
-          shell-command-switch cmd))))))
+          shell-command-switch cmd))
+       jq-cmd))))
+
+;; -------------------------------------------------------------------
+;;; Jq Options / Arguments
+
+(defun jq-shell-initial-arguments ()
+  "Initial values for `jq-shell-arguments'."
+  (when jq-shell-minor-mode
+    (jq-shell--session-args jq-shell-session)))
+
+(transient-define-suffix jq-shell-set-arguments (args &optional run)
+  "Save jq arguments for current session."
+  (interactive (list (transient-args 'jq-shell-arguments)
+                     (equal "<return>" (oref (transient-suffix-object) key))))
+  (setf (jq-shell--session-args jq-shell-session) args)
+  (and run (jq-shell-run)))
+  
+;;; TODO: set named arguments
+;; (transient-define-infix jq-shell-arg ()
+;;   :multi-value t)
+
+;; (transient-define-infix jq-shell-argjson ()
+;;   :mutli-value t)
+
+(transient-define-prefix jq-shell-arguments ()
+  "Show menu for jq shell flags."
+  :value #'jq-shell-initial-arguments
+  ["Options"
+   ("r" "Output raw strings" ("-r" "--raw-output"))
+   ("R" "Read raw strings" ("-R" "--raw-input"))
+   ("c" "Compact Output" ("-c" "--compact-output"))
+   ("s" "Slurp" ("-s" "--slurp"))
+   ("n" "Use 'null' as input value" ("-n" "--null-input"))]
+  ["Arguments"
+   ;; Note: allow multiple selections
+   ;; ("--arg" "Set variable" jq-shell-arg)
+   ;; ("--argjson" "Set variable with JSON value" jq-shell-argjson)
+   ;; ("--args")
+   ;; ("--jsonargs" "")
+   ]
+  ["Commands"
+   ("s" "Set" jq-shell-set-arguments)
+   ("<return>" "Set and run" jq-shell-set-arguments)])
 
 ;; -------------------------------------------------------------------
 ;;; Commands
@@ -270,7 +367,7 @@ Restore initial window configuration unless NO-RESTORE."
 (defun jq-shell-run (&optional prefix)
   "Manually run current jq query.
 With \\[universal-argument] PREFIX, run query before point."
-  (interactive nil jq-shell-minor-mode)
+  (interactive "P" jq-shell-minor-mode)
   (if prefix (jq-shell--run (point-min) (point))
     (jq-shell--run)))
 
@@ -294,6 +391,11 @@ With \\[universal-argument] PREFIX, run query before point."
   (interactive nil jq-shell-minor-mode-map)
   (with-current-buffer (jq-shell--session-stdout jq-shell-session)
     (erase-buffer)))
+
+(defun jq-shell-arrange-windows ()
+  "Arrange windows for current session."
+  (interactive nil jq-shell-minor-mode-map)
+  (jq-shell--arrange-windows jq-shell-session))
 
 ;;;###autoload
 (defun jq-shell (&optional buffer region)
