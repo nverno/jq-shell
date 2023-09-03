@@ -135,7 +135,7 @@ When non-nil, display errors in overlay in shell buffer instead."
   "Update header OVERLAY in BUFFER with STR or PLACEHOLDER."
   (with-current-buffer buffer
     (unless (and (boundp overlay) (overlayp (symbol-value overlay)))
-      (overlay-put 
+      (overlay-put
        (set overlay (make-overlay (point-min) (point-min) (current-buffer) 'front))
        'invisible t))
     (let ((ov (symbol-value overlay))
@@ -248,8 +248,9 @@ Restore initial window configuration unless NO-RESTORE."
     nil))
 
 (defun jq-shell-should-run-p ()
-  "Non-nil when no errors/missing identifiers are detected in tree sitter
-parse tree."
+  "Non-nil when no current command should run.
+Currently, this function checks for errors or missing identifiers in tree
+sitter parse tree."
   (and jq-shell-minor-mode
        (null (jq-shell--update-errors))
        ;; Note: error query won't pick up missing trailing node until a space is
@@ -265,10 +266,16 @@ parse tree."
 
 (defun jq-shell--format-command (args jq-cmd)
   "Format jq cmd from ARGS and JQ-CMD."
-  (let ((cmd (concat "jq " (mapconcat 'identity args " "))))
-    (add-text-properties
-     0 (length cmd) (list 'face 'font-lock-function-name-face) cmd)
-    (concat cmd " '" jq-cmd "'")))
+  (let ((cmd (concat "jq " (jq-shell--arguments args))))
+    (concat (propertize cmd 'face 'font-lock-function-name-face) " '" jq-cmd "'")))
+
+(defun jq-shell--arguments (args)
+  "Format jq command line arguments ARGS."
+  (mapconcat (lambda (arg)
+               (if (stringp arg) arg
+                 (let ((key (car arg)))
+                   (mapconcat (lambda (a) (concat key " " a)) (cdr arg) " "))))
+             args " "))
 
 (defun jq-shell--update-output (status &optional jq-cmd)
   "Update session buffers after command exited with STATUS.
@@ -310,7 +317,8 @@ Optionally, add JQ-CMD to jq command in stdout."
            (jq-cmd (buffer-substring beg end))
            (cmd (format "%s %s %s"
                         jq-shell-command
-                        (mapconcat 'identity args " ")
+                        (jq-shell--arguments args)
+                        ;; (mapconcat 'identity args " ")
                         (shell-quote-argument jq-cmd))))
       (jq-shell--update-output
        (with-current-buffer stdin
@@ -334,9 +342,41 @@ Optionally, add JQ-CMD to jq command in stdout."
   (setf (jq-shell--session-args jq-shell-session) args)
   (and run (jq-shell-run)))
   
-;;; TODO: set named arguments
+;; (defclass jq-shell--arg (transient-option)
+;;   ((reader :initform #'jq-shell--arg-reader)
+;;    (always-read :initform t)
+;;    (set-value :initarg :set-value :initform #'jq-shell--set-arg)))
+
+;; (defun jq-shell--arg-reader (_prompt _initial-input _history)
+;;   (format "%s %s"
+;;           (read-string "Variable: ")
+;;           (read-string "Value: ")))
+
+;; (cl-defmethod transient-init-value ((obj jq-shell--arg))
+;;   (or (cl-call-next-method obj) nil)
+;;   (oset obj value (symbol-value (oref obj variable)))
+;;   )
+
+;; (cl-defmethod transient-infix-set ((obj jq-shell--arg) value)
+;;   (funcall (oref obj set-value)
+;;            ;; (oref obj variable)
+;;            (oset obj value value)))
+
+;; (cl-defmethod transient-format-description ((obj jq-shell--arg))
+;;   (cl-call-next-method obj))
+
+;; (cl-defmethod transient-format-value ((obj jq-shell--arg))
+;;   (concat " --arg " (oref obj value)))
+
+;; (defun jq-shell--set-arg (key val)
+;;   (message "Setting %s = %s" key val))
+
 ;; (transient-define-infix jq-shell-arg ()
-;;   :multi-value t)
+;;   :class 'jq-shell--arg
+;; :variable "$var";; :initform
+;; :value :initarg "value"
+;; '(lambda () (read-string "Variable: "))
+;; :multi-value t)
 
 ;; (transient-define-infix jq-shell-argjson ()
 ;;   :mutli-value t)
@@ -345,14 +385,16 @@ Optionally, add JQ-CMD to jq command in stdout."
   "Show menu for jq shell flags."
   :value #'jq-shell-initial-arguments
   ["Options"
-   ("r" "Output raw strings" ("-r" "--raw-output"))
-   ("R" "Read raw strings" ("-R" "--raw-input"))
-   ("c" "Compact Output" ("-c" "--compact-output"))
-   ("s" "Slurp" ("-s" "--slurp"))
-   ("n" "Use 'null' as input value" ("-n" "--null-input"))]
-  ["Arguments"
-   ;; Note: allow multiple selections
-   ;; ("--arg" "Set variable" jq-shell-arg)
+   ("-r" "Output raw strings" ("-r" "--raw-output") :shortarg "-r")
+   ("-R" "Read raw strings" ("-R" "--raw-input"))
+   ("-c" "Compact Output" ("-c" "--compact-output"))
+   ("-s" "Slurp" ("-s" "--slurp"))
+   ("-n" "Use 'null' as input value" ("-n" "--null-input"))
+   ("-S" "Sort keys" ("-S" "--sort-keys"))]
+  ["Arguments (comma-separated for multiple, eg. a 1, b 2)"
+   ;; FIXME: current args as initial input, additional infix command
+   ;; to append args?
+   ("a" "Set variable" "--arg" :class transient-option :multi-value t)
    ;; ("--argjson" "Set variable with JSON value" jq-shell-argjson)
    ;; ("--args")
    ;; ("--jsonargs" "")
