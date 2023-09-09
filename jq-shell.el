@@ -273,8 +273,11 @@ sitter parse tree."
   "Format jq command line arguments ARGS."
   (mapconcat (lambda (arg)
                (if (stringp arg) arg
-                 (let ((key (car arg)))
-                   (mapconcat (lambda (a) (concat key " " a)) (cdr arg) " "))))
+                 (pcase-let ((`(,flag ,name ,value) arg))
+                   (concat flag " " name " " value))
+                 ;; (let ((key (car arg)))
+                 ;;   (mapconcat (lambda (a) (concat key " " a)) (cdr arg) " "))
+                 ))
              args " "))
 
 (defun jq-shell--update-output (status &optional jq-cmd)
@@ -339,6 +342,7 @@ Optionally, add JQ-CMD to jq command in stdout."
   "Save jq arguments for current session."
   (interactive (list (transient-args 'jq-shell-arguments)
                      (equal "<return>" (oref (transient-suffix-object) key))))
+  (message "args: %S" args)
   (setf (jq-shell--session-args jq-shell-session) args)
   (and run (jq-shell-run)))
   
@@ -380,28 +384,41 @@ Optionally, add JQ-CMD to jq command in stdout."
 
 ;; (transient-define-infix jq-shell-argjson ()
 ;;   :mutli-value t)
+(defun jq-shell--add-argument (name value)
+  (interactive "sName: \nsValue: ")
+  (transient-insert-suffix
+    'jq-shell-arguments
+    '(0 1 1)
+    (list (concat ":" name) (format "Modify %s" name) value
+          :init-value (lambda (obj)
+                        (message "obj = %S" obj)
+                        (concat "--arg " name " " value))
+          :transient t))
+  (transient-setup 'jq-shell-arguments))
 
 (transient-define-prefix jq-shell-arguments ()
   "Show menu for jq shell flags."
   :value #'jq-shell-initial-arguments
-  ["Options"
-   ("-r" "Output raw strings" ("-r" "--raw-output") :shortarg "-r")
-   ("-R" "Read raw strings" ("-R" "--raw-input"))
-   ("-c" "Compact Output" ("-c" "--compact-output"))
-   ("-s" "Slurp" ("-s" "--slurp"))
-   ("-n" "Use 'null' as input value" ("-n" "--null-input"))
-   ("-S" "Sort keys" ("-S" "--sort-keys"))]
-  ["Arguments (comma-separated for multiple, eg. a 1, b 2)"
-   ;; FIXME: current args as initial input, additional infix command
-   ;; to append args?
-   ("a" "Set variable" "--arg" :class transient-option :multi-value t)
-   ;; ("--argjson" "Set variable with JSON value" jq-shell-argjson)
-   ;; ("--args")
-   ;; ("--jsonargs" "")
-   ]
-  ["Commands"
-   ("s" "Set" jq-shell-set-arguments)
-   ("<return>" "Set and run" jq-shell-set-arguments)])
+  [["Options"
+    ("-r" "Output raw strings" ("-r" "--raw-output") :shortarg "-r")
+    ("-R" "Read raw strings" ("-R" "--raw-input"))
+    ("-c" "Compact Output" ("-c" "--compact-output"))
+    ("-s" "Slurp" ("-s" "--slurp"))
+    ("-n" "Use 'null' as input value" ("-n" "--null-input"))
+    ("-S" "Sort keys" ("-S" "--sort-keys"))]
+   ["Arguments"
+    ;; :class transient-option :multi-value t
+    ("A" "Add --arg" jq-shell--add-argument)
+    ""
+    ;; FIXME: current args as initial input, additional infix command
+    ;; to append args?
+    ;; ("--argjson" "Set variable with JSON value" jq-shell-argjson)
+    ;; ("--args")
+    ;; ("--jsonargs" "")
+    ]
+   ["Commands"
+    ("s" "Set" jq-shell-set-arguments)
+    ("<return>" "Set and run" jq-shell-set-arguments)]])
 
 ;; -------------------------------------------------------------------
 ;;; Commands
