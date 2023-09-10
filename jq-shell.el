@@ -384,16 +384,36 @@ Optionally, add JQ-CMD to jq command in stdout."
 
 ;; (transient-define-infix jq-shell-argjson ()
 ;;   :mutli-value t)
+
+;;; FIXME: somehow set value and update transient object when
+;;; adding new suffix command
 (defun jq-shell--add-argument (name value)
   (interactive "sName: \nsValue: ")
-  (transient-insert-suffix
-    'jq-shell-arguments
-    '(0 1 1)
-    (list (concat ":" name) (format "Modify %s" name) value
-          :init-value (lambda (obj)
-                        (message "obj = %S" obj)
-                        (concat "--arg " name " " value))
-          :transient t))
+  (let ((key (concat ":" name)))
+    (transient-append-suffix
+      'jq-shell-arguments
+      '(0 1 1)
+      (list key (format "Modify %s" name) (concat "--arg " name " ")
+            :prompt (concat name ": ")
+            :class 'transient-option
+            :transient t))
+    (transient-setup 'jq-shell-arguments)
+    ;; (let* ((suf (transient-get-suffix 'jq-shell-arguments key))
+    ;;        (cmd (plist-get (elt suf 2) :command))
+    ;;        ;; (obj (transient-suffix-object
+    ;;        ;;       (elt suf 2)))
+    ;;        )
+    ;;   ;; (transient-infix-set obj value)
+    ;;   )
+    )
+  ;; (transient--show)
+  ;; (let ((obj (transient-suffix-object)))
+  ;;   (transient-infix-set obj (transient-infix-read obj)))
+  )
+
+(defun jq-shell--remove-argument (name)
+  (interactive "sName: ")
+  (transient-remove-suffix 'jq-shell-arguments (concat ":" name))
   (transient-setup 'jq-shell-arguments))
 
 (transient-define-prefix jq-shell-arguments ()
@@ -409,6 +429,7 @@ Optionally, add JQ-CMD to jq command in stdout."
    ["Arguments"
     ;; :class transient-option :multi-value t
     ("A" "Add --arg" jq-shell--add-argument)
+    ("D" "Remove argument" jq-shell--remove-argument)
     ""
     ;; FIXME: current args as initial input, additional infix command
     ;; to append args?
