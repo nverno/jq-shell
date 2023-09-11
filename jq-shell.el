@@ -35,7 +35,12 @@
 ;; errors or missing nodes from the parse tree are highlighted similarly to
 ;; flycheck.
 ;;
-;; If `json-mode' is available, the result buffer will be `json-mode'.
+;; From the jq-shell, calling `jq-shell-menu' pops up a transient menu
+;; for managing the session. There are commands to:
+;;  - modify options passed to jq
+;;  - define jq arguments (--arg/--argjson)
+;;  - change output buffer format
+;;  - change stdin
 ;;
 ;;; Code:
 
@@ -57,6 +62,10 @@
   "Default jq arguments (long-form) for running queries."
   :type '(repeat string))
 
+(defcustom jq-shell-default-output-mode (when (featurep 'json-mode) 'json-mode)
+  "Default `major-mode' for output buffer."
+  :type 'symbol)
+
 (defcustom jq-shell-autorun t
   "Eagerly run jq queries as they are entered."
   :type 'boolean)
@@ -72,7 +81,7 @@ When non-nil, display errors in overlay in shell buffer instead."
   "C-c C-a" #'jq-shell-toggle-autorun
   "C-c C-l" #'jq-shell-clear-output
   "C-c C-c" #'jq-shell-run
-  "C-c C-f" #'jq-shell-arguments
+  "C-c C-o" #'jq-shell-menu
   "C-c C-w" #'jq-shell-arrange-windows)
 
 (define-minor-mode jq-shell-minor-mode
@@ -93,6 +102,7 @@ When non-nil, display errors in overlay in shell buffer instead."
   stdin                                       ; stdin buffer
   stdout                                      ; stdout buffer
   stderr                                      ; stderr buffer
+  (output-mode jq-shell-default-output-mode)  ; major mode for output buffer
   (args jq-shell-default-arguments)           ; jq arguments
   (stderr-file (make-temp-file "jq-shell")))  ; stderr file
 
@@ -158,8 +168,6 @@ When non-nil, display errors in overlay in shell buffer instead."
     (if (buffer-live-p buf) buf
       (with-current-buffer (get-buffer-create name)
         (erase-buffer)
-        (when (fboundp 'json-mode)
-          (json-mode))
         (current-buffer)))))
 
 (defun jq-shell--stderr-buffer (stdin)
@@ -305,11 +313,23 @@ Optionally, add JQ-CMD to jq command in stdout."
          stdout 'jq-shell--command (jq-shell--format-command args jq-cmd)
          "\n\n")))))
 
+(defun jq-shell--prepare-output (session)
+  "Setup output buffer for SESSION prior to run."
+  (pcase-let (((cl-struct jq-shell--session stdout output-mode) session))
+    (with-current-buffer stdout
+      (when (and (fboundp output-mode) (not (eq output-mode major-mode)))
+        (let ((cmd jq-shell--command))
+          (funcall output-mode)
+          (setq jq-shell--command cmd)))
+      (goto-char (point-min)))))
+
 (defun jq-shell--run (&optional beg end)
   "Run jq cmd from BEG to END in jq shell buffer."
   (jq-shell--ensure-live jq-shell-session)
+  (jq-shell--prepare-output jq-shell-session)
   (pcase-let (((cl-struct jq-shell--session region stdin stdout stderr-file args)
                jq-shell-session))
+    ;; FIXME: unnecessary if -S
     (unless (buffer-live-p stdin)
       (user-error "Input buffer %s is dead" (buffer-name stdin)))
     (let* ((beg (or beg (point-min)))
@@ -328,80 +348,117 @@ Optionally, add JQ-CMD to jq command in stdout."
        jq-cmd))))
 
 ;; -------------------------------------------------------------------
-;;; Jq Options / Arguments
+;;; Transient: Jq Menu for switches, options, arguments
 
-(defun jq-shell-initial-arguments ()
-  "Initial values for `jq-shell-arguments'."
+(defun jq-shell--initial-arguments ()
+  "Initial values for `jq-shell-menu'."
   (when jq-shell-minor-mode
+    ;; FIXME: map :shortargs to :arguments
     (jq-shell--session-args jq-shell-session)))
 
-(transient-define-suffix jq-shell-set-arguments (args &optional run)
-  "Save jq arguments for current session."
-  (interactive (list (transient-args 'jq-shell-arguments)
+(defclass jq-shell-variable (transient-lisp-variable)
+  ((argument :initform "")
+   (set-value :initarg :set-value
+              :initform (lambda (sym val) (setf (slot-value jq-shell-session sym) val)))
+   (format :initform " %k %d (%v)"))
+  "Class used for jq options that update session.")
+
+(defclass jq-shell-arguments (transient-option) ()
+  "Class used for jq arguments.")
+
+(cl-defmethod transient-init-value ((obj jq-shell-variable))
+  (oset obj value (slot-value jq-shell-session (oref obj variable))))
+
+(cl-defmethod transient-infix-read :around ((obj jq-shell-arguments))
+  "Set `transient-read-with-initial-input' to t when reading args."
+  (let ((transient-read-with-initial-input t))
+    (cl-call-next-method obj)))
+
+(transient-define-infix jq-shell--set-output-mode ()
+  "Set output buffer's `major-mode'."
+  :description "Set output mode"
+  :class 'jq-shell-variable
+  :variable 'output-mode
+  :prompt "Mode: "
+  :reader (lambda (prompt initial-input history)
+            (intern (completing-read
+                     prompt obarray
+                     (lambda (sym) (string-match-p "-mode\\'" (symbol-name sym)))
+                     t initial-input history))))
+
+(transient-define-infix jq-shell--set-stdin ()
+  "Set stdin buffer."
+  :description "Set stdin"
+  :class 'jq-shell-variable
+  :variable 'stdin
+  :prompt "Stdin: "
+  :reader (lambda (prompt initial-input _history)
+            (get-buffer (read-buffer prompt initial-input t))))
+
+(transient-define-infix jq-shell--arg ()
+  "Define jq --arg arguments, eg. '--arg k v'."
+  :description "Set arg(s)"
+  :class 'jq-shell-arguments
+  :argument "--arg "
+  :multi-value 'repeat
+  :prompt "--arg k v[,k v]*: ")
+
+(transient-define-infix jq-shell--argjson ()
+  "Define jq --argjson arguments."
+  :description "Set argjson(s)"
+  :class 'jq-shell-arguments
+  :argument "--argjson "
+  :multi-value 'repeat
+  ;; XXX: nicer way to read json values?
+  :prompt "--argjson k v[,k v]*: ")
+
+(transient-define-suffix jq-shell--set-arguments (args &optional run)
+  "Set jq arguments for current session."
+  (interactive (list (transient-args 'jq-shell-menu)
                      (equal "<return>" (oref (transient-suffix-object) key))))
   (setf (jq-shell--session-args jq-shell-session) args)
   (and run (jq-shell-run)))
-  
-;; (defclass jq-shell--arg (transient-option)
-;;   ((reader :initform #'jq-shell--arg-reader)
-;;    (always-read :initform t)
-;;    (set-value :initarg :set-value :initform #'jq-shell--set-arg)))
 
-;; (defun jq-shell--arg-reader (_prompt _initial-input _history)
-;;   (format "%s %s"
-;;           (read-string "Variable: ")
-;;           (read-string "Value: ")))
-
-;; (cl-defmethod transient-init-value ((obj jq-shell--arg))
-;;   (or (cl-call-next-method obj) nil)
-;;   (oset obj value (symbol-value (oref obj variable)))
-;;   )
-
-;; (cl-defmethod transient-infix-set ((obj jq-shell--arg) value)
-;;   (funcall (oref obj set-value)
-;;            ;; (oref obj variable)
-;;            (oset obj value value)))
-
-;; (cl-defmethod transient-format-description ((obj jq-shell--arg))
-;;   (cl-call-next-method obj))
-
-;; (cl-defmethod transient-format-value ((obj jq-shell--arg))
-;;   (concat " --arg " (oref obj value)))
-
-;; (defun jq-shell--set-arg (key val)
-;;   (message "Setting %s = %s" key val))
-
-;; (transient-define-infix jq-shell-arg ()
-;;   :class 'jq-shell--arg
-;; :variable "$var";; :initform
-;; :value :initarg "value"
-;; '(lambda () (read-string "Variable: "))
-;; :multi-value t)
-
-;; (transient-define-infix jq-shell-argjson ()
-;;   :mutli-value t)
-
-(transient-define-prefix jq-shell-arguments ()
-  "Show menu for jq shell flags."
-  :value #'jq-shell-initial-arguments
-  ["Options"
-   ("-r" "Output raw strings" ("-r" "--raw-output") :shortarg "-r")
-   ("-R" "Read raw strings" ("-R" "--raw-input"))
-   ("-c" "Compact Output" ("-c" "--compact-output"))
-   ("-s" "Slurp" ("-s" "--slurp"))
-   ("-n" "Use 'null' as input value" ("-n" "--null-input"))
-   ("-S" "Sort keys" ("-S" "--sort-keys"))]
-  ["Arguments (comma-separated for multiple, eg. a 1, b 2)"
-   ;; FIXME: current args as initial input, additional infix command
-   ;; to append args?
-   ("a" "Set variable" "--arg" :class transient-option :multi-value t)
-   ;; ("--argjson" "Set variable with JSON value" jq-shell-argjson)
-   ;; ("--args")
-   ;; ("--jsonargs" "")
-   ]
-  ["Commands"
-   ("s" "Set" jq-shell-set-arguments)
-   ("<return>" "Set and run" jq-shell-set-arguments)])
+(transient-define-prefix jq-shell-menu ()
+  "Show menu for jq shell."
+  :value #'jq-shell--initial-arguments
+  [ :if-non-nil jq-shell-minor-mode
+    "Switches"
+    ("-r" "Output raw strings" ("-r" "--raw-output"))
+    ("-R" "Read raw strings" ("-R" "--raw-input"))
+    ("-s" "Slurp" ("-s" "--slurp"))
+    ("-n" "Use 'null' as input value" ("-n" "--null-input"))
+    ("-e" "Set exit status" ("-e" "--exit-status"))
+    ("-L" "Add directory to search list" "-L"
+     :class transient-option :multi-value 'repeat)]
+  [ :if-non-nil jq-shell-minor-mode
+    ["Formatting"
+     ("-a" "Ascii" ("-a" "--ascii-output"))
+     ("-j" "Join" ("-j" "--join-output"))
+     ("-c" "Compact" ("-c" "--compact-output"))
+     ("-C" "Color" ("-C" "--color-output"))
+     ("-M" "Monochrome" ("-M" "--monochrome-output"))
+     ("-S" "Sort keys" ("-S" "--sort-keys"))
+     ("=t" "Indent with tabs" "--tab")
+     ("=i" "Set indent level" "--indent " :class transient-option)]
+    ["Buffers"
+     (":s" jq-shell--set-stdin)
+     (":o" jq-shell--set-output-mode)]]
+  [ :if-non-nil jq-shell-minor-mode
+    "Arguments"
+    (":a" jq-shell--arg)
+    (":j" jq-shell--argjson)
+    ;; XXX: handle these? or just have an infix for values to append to command
+    ;; ("--args")
+    ;; ("--jsonargs" "")
+    ]
+  [[ :if-non-nil jq-shell-minor-mode "Commands"
+     ("s" "Set" jq-shell--set-arguments)
+     ("<return>" "Set and run" jq-shell--set-arguments)]]
+  (interactive)
+  (if jq-shell-minor-mode
+      (transient-setup 'jq-shell-menu)
+    (user-error "Call from jq-shell buffer")))
 
 ;; -------------------------------------------------------------------
 ;;; Commands
