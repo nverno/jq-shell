@@ -27,13 +27,12 @@
 
 ;;; Commentary:
 ;;
-;; Run jq queries interactively against a source buffer, similar to the
-;; interface from https://jqplay.org.
+;; Run jq queries interactively against a source buffer or file.
+;; The interface is similar to https://jqplay.org.
 ;;
-;; The Jq shell's major mode is `jq-ts-mode', which uses tree sitter. Jq shell
-;; tries to guess if current query syntax is error-free enough to run. Any
-;; errors or missing nodes from the parse tree are highlighted similarly to
-;; flycheck.
+;; The query buffer uses `jq-ts-mode'. Jq shell tries to guess if current query
+;; syntax is error-free enough to run. Any errors or missing nodes from the
+;; parse tree are highlighted similarly to flycheck.
 ;;
 ;; From the jq-shell, calling `jq-shell-menu' pops up a transient menu
 ;; for managing the session. There are commands to:
@@ -41,6 +40,7 @@
 ;;  - define jq arguments (--arg/--argjson)
 ;;  - change output buffer format
 ;;  - change stdin
+;;  - etc.
 ;;
 ;;; Code:
 
@@ -127,7 +127,8 @@ When non-nil, display errors in overlay in shell buffer instead."
 (defun jq-shell--arrange-windows (session)
   "Arrange windows for SESSION."
   (pcase-let (((cl-struct jq-shell--session shell stdin stdout) session))
-    (pop-to-buffer stdin nil t)
+    (when (bufferp stdin)
+      (pop-to-buffer stdin nil t))
     (delete-other-windows)
     (window--display-buffer stdout (split-window-horizontally) 'window)
     (select-window
@@ -161,48 +162,45 @@ When non-nil, display errors in overlay in shell buffer instead."
     (add-hook 'kill-buffer-hook #'jq-shell--cleanup nil t)
     (setq-local jq-shell-session session)))
 
-(defun jq-shell--stdout-buffer (stdin)
-  "Setup stdout for STDIN."
-  (let* ((name (format "*jq[%s]::stdout*" (buffer-name stdin)))
+(defun jq-shell--get-buffer (type stdin)
+  "Setup output buffer of TYPE for STDIN."
+  (let* ((name (format "*jq[%s]::%s*"
+                       (if (bufferp stdin) (buffer-name stdin) stdin)
+                       type))
          (buf (get-buffer name)))
     (if (buffer-live-p buf) buf
       (with-current-buffer (get-buffer-create name)
         (erase-buffer)
         (current-buffer)))))
 
-(defun jq-shell--stderr-buffer (stdin)
-  "Get or create stderr buffer for STDIN."
-  (let* ((name (format "*jq[%s]::stderr*" (buffer-name stdin)))
-         (buf (get-buffer name)))
-    (if (buffer-live-p buf) buf
-      (with-current-buffer (get-buffer-create name)
-        (erase-buffer)
-        (current-buffer)))))
-
-(defun jq-shell-make-session (&optional buffer region)
-  "Create a new jq shell session for BUFFER or current buffer.
+(defun jq-shell-make-session (&optional buffer-or-file region)
+  "Create a new jq shell session for BUFFER-OR-FILE or current buffer.
 Use REGION if non-nil, or current region if active, or whole buffer."
-  (let ((buffer (or buffer (current-buffer))))
-    (set-buffer buffer)
-    (let ((session
-           (jq-shell--make-session
-            :stdin buffer
-            :region (or region
+  (or buffer-or-file (setq buffer-or-file (current-buffer)))
+  (when (bufferp buffer-or-file)
+    (set-buffer buffer-or-file))
+  (let ((session
+         (jq-shell--make-session
+          :stdin buffer-or-file
+          :region (when (bufferp buffer-or-file)
+                    (or region
                         (and (region-active-p) (car (region-bounds)))
-                        (cons (point-min) (point-max)))
-            :stdout (jq-shell--stdout-buffer buffer)
-            :stderr (jq-shell--stderr-buffer buffer)
-            :shell (get-buffer-create (format "*jq[%s]*" (buffer-name buffer))))))
-      (jq-shell--setup-shell session)
-      (puthash (jq-shell--session-shell session) session jq-shell-sessions))))
+                        (cons (point-min) (point-max))))
+          :stdout (jq-shell--get-buffer "stdout" buffer-or-file)
+          :stderr (jq-shell--get-buffer "stderr" buffer-or-file)
+          :shell (jq-shell--get-buffer "" buffer-or-file))))
+    (jq-shell--setup-shell session)
+    (puthash (jq-shell--session-shell session) session jq-shell-sessions)))
 
 (defun jq-shell--ensure-live (session)
   "Ensure buffers are available for SESSION."
   (pcase-let (((cl-struct jq-shell--session stdin stdout stderr) session))
     (unless (buffer-live-p stdout)
-      (setf (jq-shell--session-stdout session) (jq-shell--stdout-buffer stdin)))
+      (setf (jq-shell--session-stdout session)
+            (jq-shell--get-buffer "stdout" stdin)))
     (unless (buffer-live-p stderr)
-      (setf (jq-shell--session-stderr session) (jq-shell--stderr-buffer stdin)))))
+      (setf (jq-shell--session-stderr session)
+            (jq-shell--get-buffer "stderr" stdin)))))
 
 (defun jq-shell--cleanup (&optional buffer no-restore)
   "Cleanup resources associated with jq shell BUFFER.
@@ -234,8 +232,7 @@ Restore initial window configuration unless NO-RESTORE."
 (defface jq-shell-error
   '((((supports :underline (:style wave)))
      :underline (:style wave :color "Red1"))
-    (t
-     :underline t :inherit error))
+    (t :underline t :inherit error))
   "Jq shell face for errors.")
 
 (defun jq-shell--make-error-overlay (beg end)
@@ -330,8 +327,8 @@ Optionally, add JQ-CMD to jq command in stdout."
   (pcase-let (((cl-struct jq-shell--session region stdin stdout stderr-file args)
                jq-shell-session))
     ;; FIXME: unnecessary if -S
-    (unless (buffer-live-p stdin)
-      (user-error "Input buffer %s is dead" (buffer-name stdin)))
+    ;; (unless (buffer-live-p stdin)
+    ;;   (user-error "Input buffer %s is dead" (buffer-name stdin)))
     (let* ((beg (or beg (point-min)))
            (end (or end (point-max)))
            (jq-cmd (buffer-substring beg end))
@@ -339,13 +336,17 @@ Optionally, add JQ-CMD to jq command in stdout."
                         jq-shell-command
                         (jq-shell--arguments args)
                         ;; (mapconcat 'identity args " ")
-                        (shell-quote-argument jq-cmd))))
-      (jq-shell--update-output
-       (with-current-buffer stdin
-         (call-process-region
-          (car region) (cdr region) shell-file-name nil (list stdout stderr-file) nil
-          shell-command-switch cmd))
-       jq-cmd))))
+                        (shell-quote-argument jq-cmd)))
+           (status (if (bufferp stdin)
+                       (with-current-buffer stdin
+                         (call-process-region
+                          (car region) (cdr region)
+                          shell-file-name nil (list stdout stderr-file) nil
+                          shell-command-switch cmd))
+                     (process-file
+                      shell-file-name stdin (list stdout stderr-file) nil
+                      shell-command-switch cmd))))
+      (jq-shell--update-output status jq-cmd))))
 
 ;; -------------------------------------------------------------------
 ;;; Transient: Jq Menu for switches, options, arguments
@@ -497,23 +498,23 @@ With \\[universal-argument] PREFIX, run query before point."
   (jq-shell--arrange-windows jq-shell-session))
 
 ;;;###autoload
-(defun jq-shell (&optional buffer region)
-  "Run jq interactively on current buffer.
-With \\[universal-argument] interactively choose input BUFFER.
+(defun jq-shell (&optional buffer-or-file region)
+  "Run jq interactively on current buffer or choose input file.
+With \\[universal-argument] interactively choose input BUFFER-OR-FILE.
 
 If REGION is non-nil, or there is an active region in the current buffer,
 jq input is restricted to that region. REGION is a cons cell specifying the
 start and end of the region."
   (interactive
    (let ((buf (if current-prefix-arg
-                  (get-buffer (read-buffer "Source buffer: " nil t))
+                  (read-file-name "Input file: ")
                 (current-buffer))))
-     (list buf  (unless current-prefix-arg
-                  (if (region-active-p) (car (region-bounds))
-                    (cons (point-min) (point-max)))))))
+     (list buf (unless current-prefix-arg
+                 (if (region-active-p) (car (region-bounds))
+                   (cons (point-min) (point-max)))))))
   (setq jq-shell--window-configuration (current-window-configuration))
   (condition-case-unless-debug err
-      (jq-shell--arrange-windows (jq-shell-make-session buffer region))
+      (jq-shell--arrange-windows (jq-shell-make-session buffer-or-file region))
     (error (jq-shell--restore-window-configuration)
            (error "%s" (error-message-string err)))
     (quit (jq-shell--restore-window-configuration))))
