@@ -67,12 +67,26 @@
   "Default `major-mode' for output buffer."
   :type 'symbol)
 
-(defcustom jq-shell-autorun nil
-  "Eagerly run jq queries as they are entered."
-  :type 'boolean)
+;;; TODO(6/29/24): dont require jq-ts-mode/treesit to update error overlays
+(defcustom jq-shell-jq-mode 'jq-ts-mode
+  "Major mode to use in jq shell buffer."
+  :type 'symbol)
+
+;;; TODO(6/29/24): support 'after-pipe and debounced
+(defcustom jq-shell-autorun 'after-pipe
+  "Auto-run jq queries."
+  :type '(choice (const :tag "After inserting a pipe (\"|\")" after-pipe)
+                 (number :tag "After idle time (debounce)" )
+                 (const :tag "Eagerly" t)
+                 (const :tag "Disabled" nil)))
+
+(defcustom jq-shell-run-on-startup "."
+  "Jq command to run immediately when initializing the shell."
+  :type '(choice (string :tag "Jq command")
+                 (const :tag "Disabled" nil)))
 
 (defcustom jq-shell-enable-key-completion t
-  "Enable completion-at-point for keys."
+  "Enable `completion-at-point' for keys."
   :type 'boolean)
 
 (defcustom jq-shell-errors-in-overlay nil
@@ -82,6 +96,7 @@ When non-nil, display errors in overlay in shell buffer instead."
 
 (defvar-keymap jq-shell-minor-mode-map
   :doc "Keymap in jq shell."
+  ;; "|"       #'jq-shell-pipe
   "C-c C-k" #'jq-shell-quit
   "C-c C-a" #'jq-shell-toggle-autorun
   "C-c C-l" #'jq-shell-clear-output
@@ -97,7 +112,8 @@ When non-nil, display errors in overlay in shell buffer instead."
         (remove-hook 'after-change-functions #'jq-shell-maybe-run t)
         (remove-hook 'completion-at-point-functions
                      #'jq-shell-completion-at-point t))
-    (when jq-shell-autorun
+    (when (eq t jq-shell-autorun)
+      ;; TODO(6/29/24): support 'after-pipe to limit autoruns
       (add-hook 'after-change-functions #'jq-shell-maybe-run nil t))
     (when jq-shell-enable-key-completion
       (add-hook 'completion-at-point-functions
@@ -171,10 +187,13 @@ When non-nil, display errors in overlay in shell buffer instead."
 (defun jq-shell--setup-shell (session)
   "Setup jq shell buffer for SESSION."
   (with-current-buffer (jq-shell-session-shell session)
-    (jq-ts-mode)
+    (and jq-shell-jq-mode (funcall jq-shell-jq-mode))
     (jq-shell-minor-mode)
     (add-hook 'kill-buffer-hook #'jq-shell--cleanup nil t)
-    (setq-local jq-shell--session session)))
+    (setq-local jq-shell--session session)
+    (when jq-shell-run-on-startup
+      (insert jq-shell-run-on-startup)
+      (call-interactively #'jq-shell-run))))
 
 (defun jq-shell--get-buffer (type stdin &optional hidden)
   "Setup output buffer of TYPE for STDIN.
@@ -198,24 +217,26 @@ STDOUT, STDERR, and JQ-SHELL, when non-nil, specify buffers to use.
 If NO-SETUP, return session without any setup.
 HIDDEN is passed to `jq-shell--get-buffer'."
   (or buffer-or-file (setq buffer-or-file (current-buffer)))
-  (when (bufferp buffer-or-file)
-    (set-buffer buffer-or-file))
-  (let ((session
-         (jq-shell--make-session
-          :stdin buffer-or-file
-          :region (when (bufferp buffer-or-file)
-                    (or region
-                        (and (region-active-p) (car (region-bounds)))
-                        (cons (point-min) (point-max))))
-          :stdout (or stdout
-                      (jq-shell--get-buffer "stdout" buffer-or-file hidden))
-          :stderr (or stderr
-                      (jq-shell--get-buffer "stderr" buffer-or-file hidden))
-          :shell (or jq-shell (jq-shell--get-buffer "" buffer-or-file hidden)))))
-    (if no-setup
-        session
-      (jq-shell--setup-shell session)
-      (puthash (jq-shell-session-shell session) session jq-shell-sessions))))
+  (save-current-buffer
+    (when (bufferp buffer-or-file)
+      (set-buffer buffer-or-file))
+    (let ((session
+           (jq-shell--make-session
+            :stdin buffer-or-file
+            :region (when (bufferp buffer-or-file)
+                      (or region
+                          (and (region-active-p) (car (region-bounds)))
+                          (cons (point-min) (point-max))))
+            :stdout (or stdout
+                        (jq-shell--get-buffer "stdout" buffer-or-file hidden))
+            :stderr (or stderr
+                        (jq-shell--get-buffer "stderr" buffer-or-file hidden))
+            :shell (or jq-shell
+                       (jq-shell--get-buffer "" buffer-or-file hidden)))))
+      (if no-setup
+          session
+        (jq-shell--setup-shell session)
+        (puthash (jq-shell-session-shell session) session jq-shell-sessions)))))
 
 (defun jq-shell--ensure-live (session)
   "Ensure buffers are available for SESSION."
@@ -348,7 +369,8 @@ Optionally, add JQ-CMD to jq command in stdout."
               (jq-shell--format-command (car jq-cmd) (cdr jq-cmd))))
       (and jq-cmd
            (not (looking-at-p "null"))
-           (setq jq-shell--last-cmd jq-cmd)))))
+           (setq jq-shell--last-cmd     ; remove text props
+                 (cons (car jq-cmd) (substring-no-properties (cdr jq-cmd))))))))
 
 (defun jq-shell--prepare-output (session)
   "Setup output buffer for SESSION prior to run."
@@ -374,7 +396,7 @@ Optionally, add JQ-CMD to jq command in stdout."
        shell-command-switch cmd))))
 
 (defun jq-shell--run (&optional beg end session)
-  "Run jq cmd from BEG to END in jq shell buffer."
+  "Run jq cmd from BEG to END in jq shell buffer using SESSION."
   (or session (setq session jq-shell--session))
   (jq-shell--ensure-live session)
   (jq-shell--prepare-output session)
@@ -394,6 +416,9 @@ Optionally, add JQ-CMD to jq command in stdout."
 
 ;;; Completion
 
+(defvar-local jq-shell--completion-cache nil
+  "Cache last run command and results.")
+
 (defun jq-shell--setup-completion (&optional session)
   "Setup completion for SESSION."
   (pcase-let (((cl-struct jq-shell-session stdin region shell)
@@ -402,32 +427,39 @@ Optionally, add JQ-CMD to jq command in stdout."
 
 (defun jq-shell--get-key-completions (&optional session)
   "Return key completions for SESSION's last successful output."
-  (when jq-shell--last-cmd
-    (setq session (or session jq-shell--session))
-    (or jq-shell--completion
-        (setq jq-shell--completion (jq-shell--setup-completion session)))
-    (pcase-let (((cl-struct jq-shell-session stdout) jq-shell--completion))
-      (with-current-buffer stdout
-        (erase-buffer))
-      (let ((cmd (format "%s %s %s" jq-shell-command
-                         (car jq-shell--last-cmd)
-                         (shell-quote-argument
-                          (concat (cdr jq-shell--last-cmd)
-                                  " | keys[]")))))
-        (when (zerop (jq-shell--call cmd jq-shell--completion))
-          (with-current-buffer stdout
-            (split-string (buffer-substring-no-properties
-                           (point-min) (point-max)))))))))
+  (when-let ((last-cmd jq-shell--last-cmd))
+    (if (equal last-cmd (car jq-shell--completion-cache))
+        (cdr jq-shell--completion-cache)
+      (setq session (or session jq-shell--session))
+      (or jq-shell--completion
+          (setq jq-shell--completion (jq-shell--setup-completion session)))
+      (pcase-let (((cl-struct jq-shell-session stdout) jq-shell--completion))
+        (with-current-buffer stdout
+          (erase-buffer))
+        (let ((cmd (format "%s %s %s" jq-shell-command
+                           (car last-cmd)
+                           (shell-quote-argument
+                            (concat (cdr last-cmd) " | keys[]")))))
+          (when (zerop (jq-shell--call cmd jq-shell--completion))
+            (let ((comps
+                   (with-current-buffer stdout
+                     (split-string
+                      (buffer-substring-no-properties
+                       (point-min) (point-max))))))
+              (setq jq-shell--completion-cache (cons last-cmd comps))
+              comps)))))))
 
 (defun jq-shell-completion-at-point ()
-  "Completion at point for keys."
-  (let ((end (point))
-        (beg (save-excursion
-               (skip-syntax-backward "w_" (line-beginning-position))
-               (and (eq ?. (char-before))
-                    (point)))))
-    (when beg
-      (list beg end (jq-shell--get-key-completions)))))
+  "Completion at point for JSON keys."
+  (let* ((end (point))
+         (beg (save-excursion
+                (skip-syntax-backward "w_" (line-beginning-position))
+                (and (eq ?. (char-before))
+                     (point))))
+         (comps (and beg (jq-shell--get-key-completions))))
+    (when comps
+      (list beg end comps
+            :exclusive 'no))))
 
 ;; -------------------------------------------------------------------
 ;;; Transient: Jq Menu for switches, options, arguments
@@ -449,6 +481,7 @@ Optionally, add JQ-CMD to jq command in stdout."
   "Class used for jq arguments.")
 
 (cl-defmethod transient-init-value ((obj jq-shell-variable))
+  "Init OBJ from session."
   (oset obj value (slot-value jq-shell--session (oref obj variable))))
 
 (cl-defmethod transient-infix-read :around ((obj jq-shell-arguments))
