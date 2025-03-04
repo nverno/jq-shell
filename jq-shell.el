@@ -231,6 +231,8 @@ If HIDDEN generate hidden buffers."
     (if (buffer-live-p buf) buf
       (with-current-buffer (get-buffer-create name)
         (erase-buffer)
+        (when (string= "stdout" type)
+          (setq-local buffer-undo-list t))
         (current-buffer)))))
 
 (defun jq-shell-make-session
